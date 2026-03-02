@@ -155,7 +155,7 @@ This tool performs real-time Google searches using the browser's authenticated s
       if (errorMessage.includes("Timeout") || errorMessage.includes("timeout")) {
         helpMessage = `\n\n**CAPTCHA Verification Required**
 If Google is showing a CAPTCHA verification page, please:
-1. Open webtop browser: https://webtopdev.nx.run
+1. Open webtop browser: https://webtopdev.example.com
 2. Complete the CAPTCHA verification in the browser
 3. Retry this search
 
@@ -245,7 +245,7 @@ Supports all the same filtering options as google_search.`,
       if (errorMessage.includes("Timeout") || errorMessage.includes("timeout")) {
         helpMessage = `\n\n**CAPTCHA Verification Required**
 If Google is showing a CAPTCHA verification page, please:
-1. Open webtop browser: https://webtopdev.nx.run
+1. Open webtop browser: https://webtopdev.example.com
 2. Complete the CAPTCHA verification in the browser
 3. Retry this search
 

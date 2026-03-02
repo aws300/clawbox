@@ -1,5 +1,5 @@
 global:
-  wildcardHost: nx.run
+  wildcardHost: example.com
   gateway: eg
   gatewayNamespace: aws300
   repository: 867344450900.dkr.ecr.us-west-2.amazonaws.com/
@@ -18,12 +18,12 @@ agentx:
   # config: overrides for backend config.yaml fields
   config:
     db: ""              # MongoDB connection string, defaults to global.dependencies.mongo
-    sandboxURL: "https://sandbox.nx.run"
+    sandboxURL: "https://sandbox.example.com"
     openCodeURL: "http://agentx-opencode:8310"
     version: "1.0.0"
     stt:
       model: "whisper-1"
-      baseURL: "http://devgpu.nx.run:8000/v1"
+      baseURL: "http://devgpu.example.com:8000/v1"
       apiKey: "not-needed"
       language: "zh"
 

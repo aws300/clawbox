@@ -18,7 +18,7 @@ A Model Context Protocol (MCP) server that provides Google search capabilities b
 │                                                          │
 │  ┌──────────────────┐                                   │
 │  │  Chromium Browser │◄── User can interact via         │
-│  │  (Headed + CDP)   │    https://sandboxdev.nx.run     │
+│  │  (Headed + CDP)   │    https://sandboxdev.example.com     │
 │  │  Port: 9222       │                                   │
 │  └────────┬─────────┘                                   │
 │           │                                              │
@@ -266,7 +266,7 @@ Use these operators in your query for better results:
 When Google shows a CAPTCHA verification page:
 
 1. The search automatically waits up to **2 minutes** for verification
-2. Open the sandbox browser at `https://sandboxdev.nx.run`
+2. Open the sandbox browser at `https://sandboxdev.example.com`
 3. Complete the CAPTCHA in the browser
 4. The search will automatically continue after verification
 

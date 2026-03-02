@@ -1,5 +1,5 @@
 global:
-  wildcardHost: nx.run
+  wildcardHost: example.com
   gateway: eg
   gatewayNamespace: aws300
   repository: 867344450900.dkr.ecr.us-west-2.amazonaws.com/
@@ -11,7 +11,7 @@ agentx:
 
 clawbox:
   enabled: true
-  # URL token 认证: https://clawbox-dev.nx.run/?token=<webtopToken>
+  # URL token 认证: https://clawbox-dev.example.com/?token=<webtopToken>
   webtopToken: "clawbox-2024"
   # IRSA role ARN for Bedrock access (bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream)
   irsaRoleArn: "arn:aws:iam::867344450900:role/NxlabsEKS_JumpRole"

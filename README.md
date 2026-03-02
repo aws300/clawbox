@@ -11,7 +11,7 @@ OpenClaw is the runtime gateway that runs inside the clawbox pod, bridging Claud
 The entire stack runs as a single Helm release on EKS:
 
 - **clawbox pod** — Webtop desktop container with Claude Code, OpenClaw gateway, and MCP servers co-located
-- **HTTPRoute** — Kubernetes Gateway API routes `clawbox-dev.nx.run` directly to the pod
+- **HTTPRoute** — Kubernetes Gateway API routes `clawbox-dev.example.com` directly to the pod
 - **IRSA** — Pod assumes an IAM role via ServiceAccount annotation; no credentials stored anywhere
 - **Amazon Bedrock** — Claude claude-sonnet-4-5 / claude-sonnet-4-6 served natively from AWS; no API key required
 
@@ -33,7 +33,7 @@ Two separate pipelines keep application config changes (Helm values) decoupled f
 
 ### AWS Graviton Advantages
 
-Clawbox is built as a multi-arch image (`linux/amd64`, `linux/arm64`). Running on Graviton (EKS `m7g` / `c7g` nodes) provides:
+Clawbox is built as a multi-arch image (`linux/amd64`, `linux/arm64`). Running on Graviton (EKS `m8g` / `c8g` nodes) provides:
 
 - Up to 40% better price/performance vs. x86 for long-running AI workloads
 - Native ARM execution — no emulation overhead for the Claude Code process

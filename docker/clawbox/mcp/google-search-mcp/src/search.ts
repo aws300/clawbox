@@ -114,7 +114,7 @@ function isBlockedUrl(url: string): boolean {
  */
 async function waitForCaptchaVerification(page: Page, captchaUrl: string): Promise<void> {
   console.log(`[google-search] CAPTCHA detected at: ${captchaUrl}`);
-  console.log(`[google-search] Please complete verification in webtop browser (https://webtopdev.nx.run)`);
+  console.log(`[google-search] Please complete verification in webtop browser (https://webtopdev.example.com)`);
   console.log(`[google-search] Waiting up to ${CAPTCHA_WAIT_TIMEOUT / 1000} seconds for verification...`);
   
   // Wait for URL to change away from CAPTCHA page

@@ -1,5 +1,5 @@
 global:
-  wildcardHost: nx.run
+  wildcardHost: example.com
   gateway: eg
   gatewayNamespace: aws300
   repository: 867344450900.dkr.ecr.us-west-2.amazonaws.com/
@@ -119,7 +119,7 @@ clawbox:
         "channels": {
           "matrix": {
             "enabled": true,
-            "homeserver": "https://matrix.nx.run",
+            "homeserver": "https://matrix.example.com",
             "encryption": false,
             "initialSyncLimit": 1,
             "autoJoin": "always",
@@ -138,14 +138,14 @@ clawbox:
             },
             "accounts": {
               "default": {
-                "homeserver": "https://matrix.nx.run",
-                "userId": "@claw:matrix.nx.run",
+                "homeserver": "https://matrix.example.com",
+                "userId": "@claw:matrix.example.com",
                 "accessToken": "syt_*****************************",
                 "name": "Claw Bot"
               },
               "claudecode": {
-                "homeserver": "https://matrix.nx.run",
-                "userId": "@claude:matrix.nx.run",
+                "homeserver": "https://matrix.example.com",
+                "userId": "@claude:matrix.example.com",
                 "accessToken": "syt_*****************************",
                 "name": "Claude Code Bot"
               }
