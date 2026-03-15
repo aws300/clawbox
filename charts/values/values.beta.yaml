@@ -4,10 +4,6 @@ global:
   gatewayNamespace: aws300
   repository: 867344450900.dkr.ecr.us-west-2.amazonaws.com/
 
-agentx:
-  enabled: true
-  config:
-    db: "mongodb://admin:passwd@mongo.aws300.svc.cluster.local:27017/agentx?authSource=admin"
 
 clawbox:
   enabled: true

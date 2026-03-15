@@ -2,30 +2,12 @@ global:
   wildcardHost: example.com
   gateway: eg
   gatewayNamespace: aws300
-  repository: 867344450900.dkr.ecr.us-west-2.amazonaws.com/
-  dependencies:
-    mongo: mongodb://admin:passwd@mongo.aws300.svc.cluster.local:27017?authSource=admin
-    mysql: mysql://root:passwd@mysql.aws300.svc.cluster.local:3306
-    redis: redis://:passwd@redis.aws300.svc.cluster.local:6379/0
   hpa:
     enabled: false
     minReplicas: 1
     maxReplicas: 100
     targetCPUUtilizationPercentage: 80
 
-agentx:
-  enabled: false
-  # config: overrides for backend config.yaml fields
-  config:
-    db: ""              # MongoDB connection string, defaults to global.dependencies.mongo
-    sandboxURL: "https://sandbox.example.com"
-    openCodeURL: "http://agentx-opencode:8310"
-    version: "1.0.0"
-    stt:
-      model: "whisper-1"
-      baseURL: "http://devgpu.example.com:8000/v1"
-      apiKey: "not-needed"
-      language: "zh"
 
 clawbox:
   enabled: false
@@ -39,7 +21,7 @@ clawbox:
   irsaRoleArn: ""
 
   # feishu: Feishu (Lark) channel credentials injected into openclaw.json ConfigMap.
-  # Only used when customConfig.enabled is false (the default).
+  # Only used when customConfig.enbled is false (the default).
   feishu:
     appId: ""
     appSecret: ""

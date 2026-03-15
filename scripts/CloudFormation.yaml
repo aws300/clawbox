@@ -113,11 +113,197 @@ Mappings:
 Resources:
 
   # ============================================================================
+  # SECTION 0: PRE-FLIGHT QUOTA & CONFLICT CHECK
+  # Runs before any infrastructure is created. Fails immediately if AWS service
+  # quotas are insufficient or if a deployment with the same ProjectName +
+  # EnvironmentId already exists, preventing partial or conflicting stacks.
+  # Checks: EIP, VPC, NAT Gateway/AZ, m8g availability, EKS/IAM/Lambda/Cognito
+  # naming conflicts.
+  # ============================================================================
+
+  QuotaCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QuotaCheckPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeInstanceTypeOfferings
+                  - eks:DescribeCluster
+                  - iam:GetRole
+                  - lambda:GetFunction
+                  - cognito-idp:DescribeUserPoolDomain
+                  - sts:GetCallerIdentity
+                  - service-quotas:GetServiceQuota
+                Resource: "*"
+
+  QuotaCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt QuotaCheckRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request
+          def handler(event, context):
+            def send(status, data={}, reason=''):
+              body = json.dumps({
+                'Status': status,
+                'Reason': reason or context.log_stream_name,
+                'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'Data': data,
+              }).encode()
+              req = urllib.request.Request(
+                event['ResponseURL'], data=body,
+                headers={'Content-Type': '', 'Content-Length': len(body)}, method='PUT')
+              urllib.request.urlopen(req)
+            if event['RequestType'] in ('Delete', 'Update'):
+              return send('SUCCESS')
+            p = event['ResourceProperties']
+            pn, eid, region = p['ProjectName'], p['EnvironmentId'], p['Region']
+            prefix = pn + eid
+            errors = []
+            ec2 = boto3.client('ec2', region_name=region)
+            sq = boto3.client('service-quotas', region_name=region)
+            # EIP quota
+            try:
+              used = len(ec2.describe_addresses()['Addresses'])
+              try: limit = int(sq.get_service_quota(ServiceCode='ec2', QuotaCode='L-0263D0A3')['Quota']['Value'])
+              except: limit = 5
+              if limit - used < 3:
+                errors.append(f"EIP: need 3 more, only {limit-used} free ({used}/{limit}). "
+                              "Increase quota: Service Quotas > EC2 > EC2-VPC Elastic IPs (L-0263D0A3).")
+            except Exception as e:
+              errors.append(f"EIP check error: {e}")
+            # VPC quota
+            try:
+              used = len(ec2.describe_vpcs()['Vpcs'])
+              try: limit = int(sq.get_service_quota(ServiceCode='vpc', QuotaCode='L-F678F1CE')['Quota']['Value'])
+              except: limit = 5
+              if limit - used < 1:
+                errors.append(f"VPC: {used}/{int(limit)} used, no capacity. "
+                              "Increase quota: Service Quotas > VPC > VPCs per Region (L-F678F1CE).")
+            except Exception as e:
+              errors.append(f"VPC check error: {e}")
+            # NAT Gateway quota per AZ
+            try:
+              try: nat_limit = int(sq.get_service_quota(ServiceCode='vpc', QuotaCode='L-FE5A380F')['Quota']['Value'])
+              except: nat_limit = 5
+              nats, token = [], None
+              while True:
+                kw = {'Filter': [{'Name': 'state', 'Values': ['available', 'pending']}]}
+                if token: kw['NextToken'] = token
+                resp = ec2.describe_nat_gateways(**kw)
+                nats.extend(resp['NatGateways'])
+                token = resp.get('NextToken')
+                if not token: break
+              if nats:
+                sids = list({n['SubnetId'] for n in nats})
+                sub_az = {}
+                try:
+                  sub_az = {s['SubnetId']: s['AvailabilityZone']
+                            for s in ec2.describe_subnets(SubnetIds=sids)['Subnets']}
+                except: pass
+                az_cnt = {}
+                for n in nats:
+                  az = sub_az.get(n['SubnetId'], n.get('SubnetId', '?'))
+                  az_cnt[az] = az_cnt.get(az, 0) + 1
+                for az, cnt in az_cnt.items():
+                  if cnt >= nat_limit:
+                    errors.append(f"NAT GW quota full in {az}: {cnt}/{int(nat_limit)}. "
+                                  "Increase quota: Service Quotas > VPC > NAT gateways per AZ (L-FE5A380F).")
+            except Exception as e:
+              errors.append(f"NAT GW check error: {e}")
+            # m8g instance availability (cpu-system NodePool)
+            try:
+              avail = ec2.describe_instance_type_offerings(
+                Filters=[{'Name': 'instance-type', 'Values': ['m8g.xlarge']}])['InstanceTypeOfferings']
+              if not avail:
+                errors.append(f"m8g.xlarge not available in {region}. "
+                              "Stack will deploy but cpu-system NodePool won't schedule pods.")
+            except Exception as e:
+              errors.append(f"m8g check error: {e}")
+            # EKS cluster name conflict
+            try:
+              eks = boto3.client('eks', region_name=region)
+              eks.describe_cluster(name=prefix)
+              errors.append(f"EKS cluster '{prefix}' already exists. Use a different EnvironmentId.")
+            except eks.exceptions.ResourceNotFoundException:
+              pass
+            except Exception as e:
+              errors.append(f"EKS conflict check error: {e}")
+            # IAM role name conflicts
+            iam = boto3.client('iam')
+            conflicting = []
+            for role in [f"{prefix}-EKSClusterRole", f"{prefix}-EKSNodeRole",
+                         f"{prefix}-KubectlLambdaRole", f"{prefix}-PodRole", f"{prefix}-EfsCsiRole"]:
+              try: iam.get_role(RoleName=role); conflicting.append(role)
+              except iam.exceptions.NoSuchEntityException: pass
+              except: pass
+            if conflicting:
+              errors.append(f"IAM roles already exist: {', '.join(conflicting)}. Use a different EnvironmentId.")
+            # Lambda function name conflicts
+            lm = boto3.client('lambda', region_name=region)
+            conflicting = []
+            for fn in [f"{prefix}-kubectl", f"{prefix}-cognito-setup", f"{prefix}-cognito-user-creator",
+                       f"{prefix}-eg-installer", f"{prefix}-nlb-lookup", f"{prefix}-helm-deploy"]:
+              try: lm.get_function(FunctionName=fn); conflicting.append(fn)
+              except lm.exceptions.ResourceNotFoundException: pass
+              except: pass
+            if conflicting:
+              errors.append(f"Lambda functions already exist: {', '.join(conflicting)}. Use a different EnvironmentId.")
+            # Cognito domain conflict
+            try:
+              acct = boto3.client('sts').get_caller_identity()['Account']
+              domain = f"cnf-{eid}-{acct}"
+              resp = boto3.client('cognito-idp', region_name=region).describe_user_pool_domain(Domain=domain)
+              if resp.get('DomainDescription', {}).get('Domain'):
+                errors.append(f"Cognito domain '{domain}' already exists. Use a different EnvironmentId.")
+            except Exception:
+              pass
+            # Result
+            if errors:
+              return send('FAILED', {},
+                f"PRE-FLIGHT CHECK FAILED ({len(errors)} issue(s)): " + " | ".join(errors))
+            send('SUCCESS', {'Message': 'All quota and conflict checks passed.'})
+
+  QuotaCheck:
+    Type: Custom::QuotaCheck
+    Properties:
+      ServiceToken: !GetAtt QuotaCheckFunction.Arn
+      ProjectName: !Ref ProjectName
+      EnvironmentId: !Ref EnvironmentId
+      Region: !Ref "AWS::Region"
+
+  # ============================================================================
   # SECTION 1: VPC + NETWORKING (IPv6 Dual-Stack)
   # ============================================================================
 
   VPC:
     Type: AWS::EC2::VPC
+    DependsOn: QuotaCheck
     Properties:
       CidrBlock: !Ref VpcCidr
       EnableDnsHostnames: true
@@ -134,6 +320,7 @@ Resources:
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    DependsOn: QuotaCheck
     Properties:
       Tags:
         - Key: Name
@@ -153,6 +340,7 @@ Resources:
   # --- Elastic IPs for NAT Gateways ---
   EipNatA:
     Type: AWS::EC2::EIP
+    DependsOn: QuotaCheck
     Properties:
       Domain: vpc
       Tags:
@@ -161,6 +349,7 @@ Resources:
 
   EipNatB:
     Type: AWS::EC2::EIP
+    DependsOn: QuotaCheck
     Properties:
       Domain: vpc
       Tags:
@@ -169,6 +358,7 @@ Resources:
 
   EipNatC:
     Type: AWS::EC2::EIP
+    DependsOn: QuotaCheck
     Properties:
       Domain: vpc
       Tags:
@@ -448,6 +638,7 @@ Resources:
   # --- EKS Cluster Role ---
   EksClusterRole:
     Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
     Properties:
       RoleName: !Sub "${ProjectName}${EnvironmentId}-EKSClusterRole"
       AssumeRolePolicyDocument:
@@ -469,6 +660,7 @@ Resources:
   # --- EKS Node Role ---
   EksNodeRole:
     Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
     Properties:
       RoleName: !Sub "${ProjectName}${EnvironmentId}-EKSNodeRole"
       AssumeRolePolicyDocument:
@@ -486,6 +678,7 @@ Resources:
   # --- Lambda Execution Role (for K8s resource management) ---
   KubectlLambdaRole:
     Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
     Properties:
       RoleName: !Sub "${ProjectName}${EnvironmentId}-KubectlLambdaRole"
       AssumeRolePolicyDocument:
@@ -582,6 +775,7 @@ Resources:
                 Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}${EnvironmentId}-PodRole"
   EfsCsiRole:
     Type: AWS::IAM::Role
+    DependsOn: QuotaCheck
     Properties:
       RoleName: !Sub "${ProjectName}${EnvironmentId}-EfsCsiRole"
       AssumeRolePolicyDocument:
@@ -695,6 +889,7 @@ Resources:
 
   EfsFileSystem:
     Type: AWS::EFS::FileSystem
+    DependsOn: QuotaCheck
     Properties:
       Encrypted: true
       PerformanceMode: generalPurpose
@@ -1143,6 +1338,7 @@ Resources:
 
   CognitoUserPool:
     Type: AWS::Cognito::UserPool
+    DependsOn: QuotaCheck
     Properties:
       UserPoolName: !Sub "${ProjectName}${EnvironmentId}"
       AutoVerifiedAttributes:
@@ -1211,6 +1407,7 @@ Resources:
   # Lambda to create Cognito admin user
   CognitoUserCreatorFunction:
     Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
     Properties:
       FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-user-creator"
       Runtime: python3.12
@@ -1802,6 +1999,7 @@ Resources:
   # Lambda to get NLB DNS name from EKS Service
   NlbLookupFunction:
     Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
     Properties:
       FunctionName: !Sub "${ProjectName}${EnvironmentId}-nlb-lookup"
       Runtime: python3.12
@@ -1901,6 +2099,7 @@ Resources:
   # SPA Cache Policies
   CachePolicyStaticAssets:
     Type: AWS::CloudFront::CachePolicy
+    DependsOn: QuotaCheck
     Properties:
       CachePolicyConfig:
         Name: !Sub "${ProjectName}${EnvironmentId}-static-30d"
@@ -1919,6 +2118,7 @@ Resources:
 
   CachePolicyHtml:
     Type: AWS::CloudFront::CachePolicy
+    DependsOn: QuotaCheck
     Properties:
       CachePolicyConfig:
         Name: !Sub "${ProjectName}${EnvironmentId}-html-1h"
@@ -1937,6 +2137,7 @@ Resources:
 
   ResponseHeadersPolicy:
     Type: AWS::CloudFront::ResponseHeadersPolicy
+    DependsOn: QuotaCheck
     Properties:
       ResponseHeadersPolicyConfig:
         Name: !Sub "${ProjectName}${EnvironmentId}-security-headers"
@@ -2024,6 +2225,7 @@ Resources:
 
   GlobalAccelerator:
     Type: AWS::GlobalAccelerator::Accelerator
+    DependsOn: QuotaCheck
     Properties:
       Name: !Sub "${ProjectName}${EnvironmentId}"
       IpAddressType: DUAL_STACK
@@ -2098,6 +2300,7 @@ Resources:
   # Helm-based app deployment
   HelmDeployFunction:
     Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
     Properties:
       FunctionName: !Sub "${ProjectName}${EnvironmentId}-helm-deploy"
       Runtime: python3.12
@@ -2220,11 +2423,10 @@ Resources:
       ClientId: !Ref CognitoUserPoolClient
       HelmSets:
         global.gatewayNamespace: envoy-gateway-system
-        global.gateway: eg
         clawbox.host.frontend: !GetAtt CloudFrontDistribution.DomainName
         clawbox.host.backend: !GetAtt GlobalAccelerator.DualStackDnsName
         clawbox.irsaRoleArn: !GetAtt PodRole.Arn
-        clawbox.config.clawboxSA: "claw-sa"
+        clawbox.clawboxSA: "clawbox-sa"
 
   # ============================================================================
   # SECTION 10.1: GA HTTPS RESOURCES (Certificate + Listener + Route)
@@ -2332,6 +2534,7 @@ Resources:
   # Lambda to update Cognito callback URLs and create JWT SecurityPolicy
   CognitoSecretFunction:
     Type: AWS::Lambda::Function
+    DependsOn: QuotaCheck
     Properties:
       FunctionName: !Sub "${ProjectName}${EnvironmentId}-cognito-setup"
       Runtime: python3.12
