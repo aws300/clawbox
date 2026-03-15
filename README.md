@@ -45,6 +45,17 @@ Clawbox is built as a multi-arch image (`linux/amd64`, `linux/arm64`). Running o
 
 Because the full environment is defined in `charts/`, every change — adding an MCP server, tuning resource limits, updating the OpenClaw config — is a reviewed, versioned pull request. The `production` GitHub environment gate enforces approval before any change reaches the cluster.
 
+## Quick Start
+
+After the CloudFormation stack reaches **CREATE_COMPLETE**, open the **Outputs** tab in the CloudFormation console:
+
+1. **Open ClawBox** — Copy the `CloudFrontDomain` value and open `https://<CloudFrontDomain>` in your browser.
+2. **Login** — Use the credentials from the Outputs tab:
+   - **Username**: `CognitoAdminUsername` (default `admin@cnf.local`)
+   - **Password**: `CognitoAdminPassword` (auto-generated, shown only once — save it immediately)
+
+> ⚠️ The admin password is generated at stack creation time and displayed only in the Outputs tab. If you lose it, delete and recreate the stack or reset the password via the Cognito console.
+
 ## Docs
 
 - [AWS IRSA Setup](docs/aws-irsa-setup.md) — Create the Bedrock IAM role and deploy with Helm
