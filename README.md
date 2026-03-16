@@ -20,7 +20,7 @@ A cloud-native OpenClaw environment on AWS — one-click deploy via CloudFormati
 
 The CloudFormation stack provisions a complete production-grade infrastructure in a single deployment (~25 minutes). The architecture uses a **dual-path** design: CloudFront for frontend access (HTTPS with caching) and Global Accelerator for backend access (TCP direct for WebSocket/streaming).
 
-![Architecture Diagram](docs/architecture.drawio)
+![Architecture Diagram](docs/architecture.png)
 
 ### What Gets Created
 
