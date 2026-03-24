@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  CloudNativeFormationForClawbox - One-click cloud-native infrastructure stack.
+  CloudNativeFormationForClawBox - One-click cloud-native infrastructure stack.
   Creates VPC(IPv6), EKS(Auto Mode), EnvoyGateway, Cognito OIDC,
   CloudFront, Global Accelerator, IRSA test pod.
   Region: ap-northeast-2 validated. Upload this single file to deploy.
@@ -55,7 +55,7 @@ Parameters:
     Description: "Project name prefix for all resources (e.g. CloudNativeFormation, ProjectCNF)"
     AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]{0,19}$"
     ConstraintDescription: "Must start with a letter, 1-20 alphanumeric characters"
-    Default: "Clawbox"
+    Default: "ClawBox"
   EnvironmentId:
     Type: String
     Description: "Unique identifier appended to all resource names (e.g. 001, dev, prod)"
@@ -893,6 +893,13 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              - Sid: BedrockInvokeModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListFoundationModels
+                Resource: "*"
               - Sid: STSCallerIdentity
                 Effect: Allow
                 Action: sts:GetCallerIdentity
@@ -904,7 +911,6 @@ Resources:
                   - iam:ListAttachedRolePolicies
                   - iam:ListRolePolicies
                 Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}${EnvironmentId}-PodRole"
-
   EfsCsiRole:
     Type: AWS::IAM::Role
     DependsOn: QuotaCheck
@@ -2659,7 +2665,7 @@ Resources:
               if pool_id and client_id and secret:
                 issuer_host=f"cognito-idp.{region}.amazonaws.com/{pool_id}"
                 auth_uri=f"oidc://{client_id}:{secret}@{issuer_host}?scope=openid%20profile%20email&oidc_logout=false"
-                cmd+=["--set",f"scaffolding.config.auth={auth_uri}"]
+                cmd+=["--set",f"clawbox.config.auth={auth_uri}"]
               L.info(f"Running: {' '.join(cmd[:8])}...")
               r=subprocess.run(cmd,capture_output=True,text=True,env=env,timeout=540)
               L.info(f"stdout: {r.stdout}")
@@ -2683,7 +2689,7 @@ Resources:
       Namespace: !Sub "clawbox-${EnvironmentId}"
       ReleaseName: !Sub "clawbox-${EnvironmentId}"
       ChartRef: "oci://public.ecr.aws/b1y9i2f3/clawbox"
-      ChartVersion: "0.2.0"
+      ChartVersion: "0.2.1"
       UserPoolId: !Ref CognitoUserPool
       ClientId: !Ref CognitoUserPoolClient
       HelmSets:
@@ -2692,6 +2698,7 @@ Resources:
         clawbox.host.frontend: !GetAtt CloudFrontDistribution.DomainName
         clawbox.host.backend: !GetAtt GlobalAccelerator.DualStackDnsName
         clawbox.irsaRoleArn: !GetAtt PodRole.Arn
+        clawbox.config.clawboxSA: "claw-sa"
 
   # ============================================================================
   # SECTION 10.1: GA HTTPS RESOURCES (Certificate + Listener + Route)
