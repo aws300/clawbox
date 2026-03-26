@@ -1069,6 +1069,11 @@ Resources:
           ToPort: 6379
           SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
           Description: "Valkey from EKS"
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+          Description: "PostgreSQL from EKS"
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}${EnvironmentId}-data-services-sg"
@@ -1187,6 +1192,44 @@ Resources:
             Description: "Semantic memory for key facts and knowledge"
             Namespaces:
               - "default/{actorId}"
+
+
+  # --- Aurora PostgreSQL 17 Serverless v2 (LiteLLM backend) ---
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName}${EnvironmentId} Aurora subnets"
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+        - !Ref PrivateSubnetC
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}${EnvironmentId}-pg"
+      Engine: aurora-postgresql
+      EngineVersion: "17.7"
+      DatabaseName: litellm
+      MasterUsername: pgadmin
+      MasterUserPassword: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DataServicesSG
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}${EnvironmentId}-pg"
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
 
   # ============================================================================
   # SECTION 4: EKS ADDONS
@@ -1952,6 +1995,40 @@ Resources:
       ClientId: !Ref CognitoUserPoolClient
       UseCognitoProvidedValues: true
 
+
+  # --- LiteLLM Cognito App Client (separate SSO client) ---
+  LiteLLMCognitoClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoUserPoolDomain
+    Properties:
+      ClientName: !Sub "${ProjectName}${EnvironmentId}-litellm"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - profile
+        - email
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}/llm/sso/callback"
+        - !Sub "https://${GlobalAccelerator.DualStackDnsName}/llm/sso/callback"
+      LogoutURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}/llm/ui/"
+        - !Sub "https://${GlobalAccelerator.DualStackDnsName}/llm/ui/"
+
+  LiteLLMManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref LiteLLMCognitoClient
+      UseCognitoProvidedValues: true
   # Pre Token Generation Lambda: maps cognito:groups → groups claim in JWT
   CognitoPreTokenGenFunction:
     Type: AWS::Lambda::Function
@@ -2106,7 +2183,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt CognitoUserCreatorFunction.Arn
       UserPoolId: !Ref CognitoUserPool
-      Username: admin@cnf.local
+      Username: admin@example.aws
       GroupName: admin
       Region: !Ref "AWS::Region"
 
@@ -2699,11 +2776,73 @@ Resources:
     DependsOn:
       - K8sInfraResources
       - NlbLookup
+      - AuroraInstance
     Properties:
       ServiceToken: !GetAtt KubectlFunction.Arn
       ClusterName: !Ref EksCluster
       Region: !Ref "AWS::Region"
-      Manifests: []
+      Manifests:
+        # --- LiteLLM Namespace ---
+        - apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: litellm
+        # --- LiteLLM ServiceAccount (IRSA via Pod Identity) ---
+        - apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: litellm-sa
+            namespace: litellm
+        # --- LiteLLM PostgreSQL credentials Secret ---
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: postgres-creds
+            namespace: litellm
+          type: Opaque
+          stringData:
+            username: pgadmin
+            password: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+        # --- LiteLLM HTTPRoute (CloudFront) ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: litellm-cf
+            namespace: litellm
+          spec:
+            parentRefs:
+              - name: eg
+                namespace: envoy-gateway-system
+            hostnames:
+              - !GetAtt CloudFrontDistribution.DomainName
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /llm
+                backendRefs:
+                  - name: litellm
+                    port: 4000
+        # --- LiteLLM HTTPRoute (GA) ---
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: litellm-ga
+            namespace: litellm
+          spec:
+            parentRefs:
+              - name: eg
+                namespace: envoy-gateway-system
+            hostnames:
+              - !GetAtt GlobalAccelerator.DualStackDnsName
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /llm
+                backendRefs:
+                  - name: litellm
+                    port: 4000
 
   # Helm-based app deployment
   HelmDeployFunction:
@@ -2808,6 +2947,39 @@ Resources:
                 issuer_host=f"cognito-idp.{region}.amazonaws.com/{pool_id}"
                 auth_uri=f"oidc://{client_id}:{secret}@{issuer_host}?scope=openid%20profile%20email&oidc_logout=false"
                 cmd+=["--set",f"clawbox.config.auth={auth_uri}"]
+              # LiteLLM-specific config
+              if props.get("LiteLLMConfig"):
+                domain=f"cnf-{props.get('EnvironmentId','001')}-{boto3.client('sts').get_caller_identity()['Account']}"
+                cognito_base=f"https://{domain}.auth.{region}.amazoncognito.com"
+                litellm_env=props.get("LiteLLMEnv",{})
+                # DB endpoint from Aurora
+                db_ep=props.get("AuroraEndpoint","")
+                if db_ep:
+                  cmd+=["--set",f"db.endpoint={db_ep}"]
+                  cmd+=["--set","db.database=litellm"]
+                  cmd+=["--set","db.url=postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):5432/$(DATABASE_NAME)"]
+                # Cognito SSO env vars
+                cmd+=["--set",f"envVars.GENERIC_CLIENT_ID={client_id}"]
+                cmd+=["--set",f"envVars.GENERIC_CLIENT_SECRET={secret}"]
+                cmd+=["--set",f"envVars.GENERIC_AUTHORIZATION_ENDPOINT={cognito_base}/oauth2/authorize"]
+                cmd+=["--set",f"envVars.GENERIC_TOKEN_ENDPOINT={cognito_base}/oauth2/token"]
+                cmd+=["--set",f"envVars.GENERIC_USERINFO_ENDPOINT={cognito_base}/oauth2/userInfo"]
+                # Logout URL
+                proxy_base=litellm_env.get("PROXY_BASE_URL","")
+                ui_url=proxy_base.rsplit("/llm",1)[0]+"/llm/ui/" if proxy_base else ""
+                cmd+=["--set",f"envVars.PROXY_LOGOUT_URL={cognito_base}/logout?client_id={client_id}&logout_uri={ui_url}"]
+                # All other LiteLLM env vars
+                for ek,ev in litellm_env.items():
+                  cmd+=["--set",f"envVars.{ek}={ev}"]
+                # Args for IPv6 binding
+                cmd+=["--set","args[0]=--config","--set","args[1]=/etc/litellm/config.yaml","--set","args[2]=--host","--set","args[3]=::"]
+                # Proxy config (model list)
+                models=[("claude-sonnet-4-6","bedrock/global.anthropic.claude-sonnet-4-6"),("claude-opus-4-6","bedrock/global.anthropic.claude-opus-4-6-v1"),("claude-sonnet-4-5-20250929","bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"),("claude-opus-4-5-20251101","bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0"),("claude-haiku-4-5-20251001","bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0")]
+                for i,(mn,mp) in enumerate(models):
+                  cmd+=["--set",f"proxy_config.model_list[{i}].model_name={mn}","--set",f"proxy_config.model_list[{i}].litellm_params.model={mp}"]
+                cmd+=["--set","proxy_config.general_settings.master_key=os.environ/PROXY_MASTER_KEY"]
+                cmd+=["--set","proxy_config.general_settings.forward_client_headers_to_llm_api=true"]
+                cmd+=["--set","proxy_config.litellm_settings.drop_params=true"]
               L.info(f"Running: {' '.join(cmd[:8])}...")
               r=subprocess.run(cmd,capture_output=True,text=True,env=env,timeout=540)
               L.info(f"stdout: {r.stdout}")
@@ -2834,6 +3006,42 @@ Resources:
       ChartVersion: "0.2.2"
       UserPoolId: !Ref CognitoUserPool
       ClientId: !Ref CognitoUserPoolClient
+      HelmSets:
+        global.gatewayNamespace: envoy-gateway-system
+        global.gateway: eg
+        clawbox.host.frontend: !GetAtt CloudFrontDistribution.DomainName
+        clawbox.host.backend: !GetAtt GlobalAccelerator.DualStackDnsName
+        clawbox.irsaRoleArn: !GetAtt PodRole.Arn
+        clawbox.config.clawboxSA: "claw-sa"
+
+  # --- LiteLLM Helm Deployment ---
+  LiteLLMDeploy:
+    Type: Custom::HelmDeploy
+    DependsOn:
+      - K8sAppResources
+      - GAHttpsSetup
+      - LiteLLMCognitoClient
+      - LiteLLMManagedLoginBranding
+    Properties:
+      ServiceToken: !GetAtt HelmDeployFunction.Arn
+      ClusterName: !Ref EksCluster
+      Region: !Ref "AWS::Region"
+      Namespace: litellm
+      ReleaseName: litellm
+      ChartRef: "oci://docker.litellm.ai/berriai/litellm-helm"
+      ChartVersion: "1.82.3"
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref LiteLLMCognitoClient
+      AuroraEndpoint: !GetAtt AuroraCluster.Endpoint.Address
+      EnvironmentId: !Ref EnvironmentId
+      LiteLLMConfig: "true"
+      LiteLLMEnv:
+        SERVER_ROOT_PATH: "/llm"
+        PROXY_BASE_URL: !Sub "https://${GlobalAccelerator.DualStackDnsName}/llm"
+        GENERIC_CLIENT_STATE: "litellm-sso"
+        AUTO_REDIRECT_UI_LOGIN_TO_SSO: "true"
+        GENERIC_ROLE_MAPPINGS_GROUP_CLAIM: "groups"
+        GENERIC_ROLE_MAPPINGS_ROLES: "{'proxy_admin': ['admin']}"
       HelmSets:
         global.gatewayNamespace: envoy-gateway-system
         global.gateway: eg
@@ -3104,3 +3312,12 @@ Outputs:
   BedrockMemoryArn:
     Description: "Bedrock AgentCore Memory ARN"
     Value: !GetAtt BedrockMemory.MemoryArn
+  AuroraEndpoint:
+    Description: "Aurora PostgreSQL Endpoint"
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  AuroraUsername:
+    Description: "Aurora PostgreSQL Username"
+    Value: pgadmin
+  AuroraPassword:
+    Description: "Aurora PostgreSQL Password"
+    Value: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
