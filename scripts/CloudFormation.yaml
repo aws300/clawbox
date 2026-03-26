@@ -2973,7 +2973,8 @@ Resources:
                 # All other LiteLLM env vars
                 for ek,ev in litellm_env.items():
                   if ek=="CLOUDFRONT_HOST":continue
-                  cmd+=["--set",f"envVars.{ek}={ev}"]
+                  flag="--set-string" if "{" in str(ev) else "--set"
+                  cmd+=[flag,f"envVars.{ek}={ev}"]
                 # Args for IPv6 binding
                 cmd+=["--set","args[0]=--config","--set","args[1]=/etc/litellm/config.yaml","--set","args[2]=--host","--set","args[3]=::"]
                 # Proxy config (model list)
@@ -3042,7 +3043,7 @@ Resources:
       LiteLLMConfig: "true"
       LiteLLMEnv:
         SERVER_ROOT_PATH: "/llm"
-        PROXY_BASE_URL: !Sub "https://${GlobalAccelerator.DualStackDnsName}/llm"
+        PROXY_BASE_URL: !Sub "https://${CloudFrontDistribution.DomainName}/llm"
         CLOUDFRONT_HOST: !GetAtt CloudFrontDistribution.DomainName
         GENERIC_CLIENT_STATE: "litellm-sso"
         AUTO_REDIRECT_UI_LOGIN_TO_SSO: "true"
@@ -3320,3 +3321,9 @@ Outputs:
   AuroraPassword:
     Description: "Aurora PostgreSQL Password"
     Value: !Sub "${ProjectName}${EnvironmentId}Pg2026!"
+  LiteLLMApiServer:
+    Description: "LiteLLM API Server (GA)"
+    Value: !Sub "https://${GlobalAccelerator.DualStackDnsName}/llm/"
+  LiteLLMAdminUI:
+    Description: "LiteLLM Admin UI (CloudFront)"
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}/llm/ui/"
