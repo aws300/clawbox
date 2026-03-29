@@ -2447,6 +2447,27 @@ Resources:
                       name: ga-https-cert
                     - kind: Secret
                       name: eg-https-cert
+
+              - name: https-7883
+                port: 7883
+                protocol: HTTPS
+                hostname: !GetAtt GlobalAccelerator.DualStackDnsName
+                allowedRoutes:
+                  namespaces:
+                    from: All
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ga-https-cert
+              - name: tcp-7881
+                port: 7881
+                protocol: TCP
+                allowedRoutes:
+                  kinds:
+                    - kind: TCPRoute
+                  namespaces:
+                    from: All
         # --- StorageClass (EFS with uid/gid 1000) ---
         - apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -2519,9 +2540,49 @@ Resources:
               send_cfn(event,ctx,"SUCCESS",pid="nlb-lookup");return
             try:
               cn=props["ClusterName"];ns=props["Namespace"]
-              svc_name=props.get("ServiceName","envoy-default-cnf")
               region=props.get("Region",boto3.session.Session().region_name)
               sess=boto3.Session(region_name=region)
+              required_port=int(props.get("RequiredPort",0))
+              # --- Mode: NLB Health Check (post-deploy) ---
+              if required_port and props.get("NlbArn"):
+                nlb_arn=props["NlbArn"]
+                elb=sess.client("elbv2")
+                eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
+                ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+                tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+                tf.write(base64.b64decode(ca));tf.flush();tf.close()
+                http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+                for attempt in range(30):
+                  if ctx.get_remaining_time_in_millis()<60000:break
+                  listeners=elb.describe_listeners(LoadBalancerArn=nlb_arn)["Listeners"]
+                  ports=[l["Port"] for l in listeners]
+                  if required_port in ports:
+                    L.info(f"NLB port {required_port} listener OK (ports: {ports})")
+                    break
+                  L.warning(f"NLB port {required_port} missing (ports: {ports}), annotating envoy svc to trigger sync...")
+                  token=get_token(sess,cn,region)
+                  hd={"Authorization":f"Bearer {token}","Accept":"application/json","Content-Type":"application/merge-patch+json"}
+                  r=http.request("GET",f"{ep}/api/v1/namespaces/envoy-gateway-system/services",headers=hd)
+                  if r.status==200:
+                    for svc in json.loads(r.data.decode()).get("items",[]):
+                      if svc.get("spec",{}).get("type")=="LoadBalancer":
+                        sn=svc["metadata"]["name"]
+                        patch=json.dumps({"metadata":{"annotations":{"nlb-sync":str(time.time())}}}).encode()
+                        http.request("PATCH",f"{ep}/api/v1/namespaces/envoy-gateway-system/services/{sn}",headers=hd,body=patch)
+                        L.info(f"Annotated {sn} for NLB sync")
+                  time.sleep(20)
+                # Verify targets healthy
+                tgs=elb.describe_target_groups(LoadBalancerArn=nlb_arn)["TargetGroups"]
+                all_healthy=True
+                for tg in tgs:
+                  health=elb.describe_target_health(TargetGroupArn=tg["TargetGroupArn"])
+                  for t in health["TargetHealthDescriptions"]:
+                    if t["TargetHealth"]["State"]!="healthy":all_healthy=False
+                L.info(f"NLB health check done. All healthy: {all_healthy}")
+                send_cfn(event,ctx,"SUCCESS",data={"NlbDns":props.get("NlbDns",""),"NlbArn":nlb_arn,"HealthCheck":"passed" if all_healthy else "degraded"},pid="nlb-health-check")
+                return
+              # --- Mode: NLB Lookup (original) ---
+              svc_name=props.get("ServiceName","envoy-default-cnf")
               eks=sess.client("eks");ci=eks.describe_cluster(name=cn)["cluster"]
               ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
               tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
@@ -2705,6 +2766,31 @@ Resources:
             OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
             ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
             Compress: true
+          - PathPattern: "/llm/sso/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+          - PathPattern: "/auth/oidc/*"
+            TargetOriginId: EnvoyGatewayNLB
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+            OriginRequestPolicyId: "216adef6-5c7f-47e4-b989-5492eafa07d3"
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 502
+            ErrorCachingMinTTL: 1
+          - ErrorCode: 503
+            ErrorCachingMinTTL: 1
+          - ErrorCode: 504
+            ErrorCachingMinTTL: 1
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}${EnvironmentId}-cf"
@@ -2762,6 +2848,52 @@ Resources:
           ClientIPPreservationEnabled: true
           Weight: 100
 
+
+  GAListenerExtra1:
+    Type: AWS::GlobalAccelerator::Listener
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: 7883
+          ToPort: 7883
+
+  GAEndpointGroupExtra1:
+    Type: AWS::GlobalAccelerator::EndpointGroup
+    Properties:
+      ListenerArn: !Ref GAListenerExtra1
+      EndpointGroupRegion: !Ref "AWS::Region"
+      HealthCheckProtocol: TCP
+      HealthCheckPort: 7883
+      HealthCheckIntervalSeconds: 30
+      ThresholdCount: 3
+      EndpointConfigurations:
+        - EndpointId: !GetAtt NlbLookup.NlbArn
+          ClientIPPreservationEnabled: true
+          Weight: 100
+
+  GAListenerExtra2:
+    Type: AWS::GlobalAccelerator::Listener
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: 7881
+          ToPort: 7881
+
+  GAEndpointGroupExtra2:
+    Type: AWS::GlobalAccelerator::EndpointGroup
+    Properties:
+      ListenerArn: !Ref GAListenerExtra2
+      EndpointGroupRegion: !Ref "AWS::Region"
+      HealthCheckProtocol: TCP
+      HealthCheckPort: 7881
+      HealthCheckIntervalSeconds: 30
+      ThresholdCount: 3
+      EndpointConfigurations:
+        - EndpointId: !GetAtt NlbLookup.NlbArn
+          ClientIPPreservationEnabled: true
+          Weight: 100
   # ============================================================================
   # SECTION 10: KUBERNETES APP RESOURCES (Test Pod + Routes + OIDC Policy)
   # ============================================================================
@@ -2979,7 +3111,11 @@ Resources:
                 for ek,ev in litellm_env.items():
                   if ek=="CLOUDFRONT_HOST":continue
                   flag="--set-string" if "{" in str(ev) else "--set"
-                  cmd+=[flag,f"envVars.{ek}={ev}"]
+                  # Helm --set-string interprets {} as array; use --set-json for dict values
+                  if "{" in str(ev) and ":" in str(ev):
+                    cmd+=["--set-json",f'envVars.{ek}={json.dumps(ev)}']
+                  else:
+                    cmd+=[flag,f"envVars.{ek}={ev}"]
                 # Args for IPv6 binding
                 cmd+=["--set","args[0]=--config","--set","args[1]=/etc/litellm/config.yaml","--set","args[2]=--host","--set","args[3]=::"]
                 # Proxy config (model list)
@@ -3023,7 +3159,7 @@ Resources:
         clawbox.host.frontend: !GetAtt CloudFrontDistribution.DomainName
         clawbox.host.backend: !GetAtt GlobalAccelerator.DualStackDnsName
         clawbox.irsaRoleArn: !GetAtt PodRole.Arn
-        clawbox.config.clawboxSA: "claw-sa"
+        clawbox.config.clawboxSA: "sa"
 
   # --- LiteLLM Helm Deployment ---
   LiteLLMDeploy:
@@ -3083,7 +3219,20 @@ Resources:
               kind: ClusterIssuer
             dnsNames:
               - !GetAtt GlobalAccelerator.DualStackDnsName
-        # --- Patch Gateway: https=GA(default), https-lb=NLB ---
+        # --- Certificate for cognito.nx.run ---
+        - apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: cognito-nx-cert
+            namespace: envoy-gateway-system
+          spec:
+            secretName: cognito-nx-https-cert
+            issuerRef:
+              name: letsencrypt-gateway
+              kind: ClusterIssuer
+            dnsNames:
+              - cognito.nx.run
+        # --- Patch Gateway: https=GA(default), https-lb=NLB, https-cognito=cognito.nx.run ---
         - apiVersion: gateway.networking.k8s.io/v1
           kind: Gateway
           metadata:
@@ -3118,6 +3267,27 @@ Resources:
                       name: ga-https-cert
                     - kind: Secret
                       name: eg-https-cert
+
+              - name: https-7883
+                port: 7883
+                protocol: HTTPS
+                hostname: !GetAtt GlobalAccelerator.DualStackDnsName
+                allowedRoutes:
+                  namespaces:
+                    from: All
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: ga-https-cert
+              - name: tcp-7881
+                port: 7881
+                protocol: TCP
+                allowedRoutes:
+                  kinds:
+                    - kind: TCPRoute
+                  namespaces:
+                    from: All
               - name: https-lb
                 port: 443
                 protocol: HTTPS
@@ -3130,6 +3300,18 @@ Resources:
                   certificateRefs:
                     - kind: Secret
                       name: eg-https-cert
+              - name: https-cognito
+                port: 443
+                protocol: HTTPS
+                hostname: cognito.nx.run
+                allowedRoutes:
+                  namespaces:
+                    from: All
+                tls:
+                  mode: Terminate
+                  certificateRefs:
+                    - kind: Secret
+                      name: cognito-nx-https-cert
         # --- ClientTrafficPolicy for HTTP/2 ---
         - apiVersion: gateway.envoyproxy.io/v1alpha1
           kind: ClientTrafficPolicy
@@ -3159,7 +3341,7 @@ Resources:
   # SECTION 11: COGNITO OIDC - SecurityPolicy (EnvoyGateway)
   # ============================================================================
 
-  # Lambda to update Cognito callback URLs and create JWT SecurityPolicy
+  # Lambda to update Cognito callback URLs and create SecurityPolicy
   CognitoSecretFunction:
     Type: AWS::Lambda::Function
     DependsOn: QuotaCheck
@@ -3172,11 +3354,32 @@ Resources:
       Role: !GetAtt KubectlLambdaRole.Arn
       Code:
         ZipFile: |
-          import json,logging,urllib3,boto3
+          import base64,json,logging,tempfile,urllib3,boto3
+          from botocore.signers import RequestSigner
           L=logging.getLogger();L.setLevel(logging.INFO)
           def send_cfn(event,ctx,status,data=None,reason=None,pid=None):
             body=json.dumps({"Status":status,"Reason":reason or f"Logs: {ctx.log_stream_name}","PhysicalResourceId":pid or event.get("PhysicalResourceId",ctx.log_stream_name),"StackId":event["StackId"],"RequestId":event["RequestId"],"LogicalResourceId":event["LogicalResourceId"],"Data":data or{}})
             urllib3.PoolManager().request("PUT",event["ResponseURL"],body=body.encode(),headers={"Content-Type":""})
+          def get_token(sess,cluster,region):
+            sts=sess.client("sts",region_name=region);si=sts.meta.service_model.service_id
+            sg=RequestSigner(si,region,"sts","v4",sess.get_credentials(),sess.events)
+            p={"method":"GET","url":f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15","body":{},"headers":{"x-k8s-aws-id":cluster},"context":{}}
+            u=sg.generate_presigned_url(p,region_name=region,expires_in=60,operation_name="")
+            return "k8s-aws-v1."+base64.urlsafe_b64encode(u.encode()).decode().rstrip("=")
+          def k8s_apply(http,ep,token,m):
+            av=m.get("apiVersion","");kind=m.get("kind","");name=m["metadata"]["name"];ns=m["metadata"].get("namespace")
+            PLURALS={"SecurityPolicy":"securitypolicies","Secret":"secrets","HTTPRoute":"httproutes"}
+            pl=PLURALS.get(kind,kind.lower()+"s")
+            px=f"apis/{av}" if "/" in av else f"api/{av}"
+            p=f"/{px}/namespaces/{ns}/{pl}" if ns else f"/{px}/{pl}"
+            hd={"Authorization":f"Bearer {token}","Content-Type":"application/json","Accept":"application/json"}
+            b=json.dumps(m).encode()
+            r=http.request("POST",f"{ep}{p}",headers=hd,body=b)
+            if r.status==409:
+              hd["Content-Type"]="application/merge-patch+json"
+              r=http.request("PATCH",f"{ep}{p}/{name}",headers=hd,body=b)
+            L.info(f"k8s_apply {kind}/{name}: {r.status}")
+            return r.status
           def handler(event,ctx):
             L.info(json.dumps(event,default=str))
             rt=event["RequestType"];props=event["ResourceProperties"]
@@ -3185,6 +3388,9 @@ Resources:
             try:
               region=props.get("Region",boto3.session.Session().region_name)
               pool_id=props["UserPoolId"];client_id=props["ClientId"]
+              cluster=props["ClusterName"];ga_dns=props.get("GADualStackDns","")
+              cognito_domain=props.get("CognitoDomain","")
+              gw_ns=props.get("GatewayNamespace","envoy-gateway-system")
               sess=boto3.Session(region_name=region)
               cog=sess.client("cognito-idp")
               # Get client secret
@@ -3194,13 +3400,10 @@ Resources:
               # Update callback URLs
               callbacks=[];logouts=[]
               cf_domain=props.get("CloudFrontDomain","")
-              ga_dns=props.get("GADualStackDns","")
-              if cf_domain:
-                callbacks.append(f"https://{cf_domain}/auth/oidc/callback")
-                logouts.append(f"https://{cf_domain}/auth/oidc/logout")
-              if ga_dns:
-                callbacks.append(f"https://{ga_dns}/auth/oidc/callback")
-                logouts.append(f"https://{ga_dns}/auth/oidc/logout")
+              for d in [cf_domain,ga_dns,cognito_domain]:
+                if d:
+                  callbacks.append(f"https://{d}/auth/oidc/callback")
+                  logouts.append(f"https://{d}/auth/oidc/logout")
               if not callbacks:
                 callbacks=["https://localhost/auth/oidc/callback"];logouts=["https://localhost/auth/oidc/logout"]
               L.info(f"Updating Cognito callbacks: {callbacks}")
@@ -3210,9 +3413,27 @@ Resources:
                 AllowedOAuthScopes=["openid","profile","email"],
                 SupportedIdentityProviders=["COGNITO"],
                 ExplicitAuthFlows=["ALLOW_USER_AUTH","ALLOW_USER_SRP_AUTH","ALLOW_REFRESH_TOKEN_AUTH"])
+              # --- Create K8s resources for SecurityPolicy ---
+              if cluster:
+                eks=sess.client("eks");ci=eks.describe_cluster(name=cluster)["cluster"]
+                ep=ci["endpoint"];ca=ci["certificateAuthority"]["data"]
+                tf=tempfile.NamedTemporaryFile(delete=False,suffix=".crt")
+                tf.write(base64.b64decode(ca));tf.flush();tf.close()
+                token=get_token(sess,cluster,region)
+                http=urllib3.PoolManager(cert_reqs="CERT_REQUIRED",ca_certs=tf.name)
+                # K8s Secret with Cognito client secret
+                k8s_apply(http,ep,token,{"apiVersion":"v1","kind":"Secret","metadata":{"name":"cognito-oidc-secret","namespace":gw_ns},"type":"Opaque","data":{"client-secret":base64.b64encode(secret.encode()).decode()}})
+                # --- cognito.nx.run: catch-all HTTPRoute + SecurityPolicy ---
+                if cognito_domain:
+                  k8s_apply(http,ep,token,{"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"name":"cognito-nx-run","namespace":gw_ns},"spec":{"parentRefs":[{"name":"eg","namespace":gw_ns,"sectionName":"https-cognito"}],"hostnames":[cognito_domain],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}})
+                  k8s_apply(http,ep,token,{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"SecurityPolicy","metadata":{"name":"cognito-oidc-nx-run","namespace":gw_ns},"spec":{"targetRefs":[{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"cognito-nx-run"}],"oidc":{"provider":{"issuer":issuer},"clientID":client_id,"clientSecret":{"group":"","kind":"Secret","name":"cognito-oidc-secret"},"redirectURL":f"https://{cognito_domain}/auth/oidc/callback","scopes":["openid","profile","email"],"forwardAccessToken":True}}})
+                  L.info("SecurityPolicy cognito-oidc-nx-run applied")
+                # --- GA /apis/v1/: scoped HTTPRoute + SecurityPolicy ---
+                if ga_dns:
+                  k8s_apply(http,ep,token,{"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"name":"apis-v1-ga","namespace":gw_ns},"spec":{"parentRefs":[{"name":"eg","namespace":gw_ns,"sectionName":"https"}],"hostnames":[ga_dns],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/apis/v1/"}}]}]}})
+                  k8s_apply(http,ep,token,{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"SecurityPolicy","metadata":{"name":"cognito-oidc-apis-v1","namespace":gw_ns},"spec":{"targetRefs":[{"group":"gateway.networking.k8s.io","kind":"HTTPRoute","name":"apis-v1-ga"}],"oidc":{"provider":{"issuer":issuer},"clientID":client_id,"clientSecret":{"group":"","kind":"Secret","name":"cognito-oidc-secret"},"redirectURL":f"https://{ga_dns}/apis/v1/auth/oidc/callback","scopes":["openid","profile","email"],"forwardAccessToken":True}}})
+                  L.info("SecurityPolicy cognito-oidc-apis-v1 applied")
               send_cfn(event,ctx,"SUCCESS",data={"CognitoIssuer":issuer,"ClientSecret":secret},pid="cognito-setup")
-            except Exception as e:
-              L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
             except Exception as e:
               L.exception("fail");send_cfn(event,ctx,"FAILED",reason=str(e)[:256])
 
@@ -3221,13 +3442,38 @@ Resources:
     DependsOn:
       - K8sAppResources
       - CognitoUserPoolClient
+      - GAHttpsSetup
     Properties:
       ServiceToken: !GetAtt CognitoSecretFunction.Arn
+      ClusterName: !Ref EksCluster
       Region: !Ref "AWS::Region"
       UserPoolId: !Ref CognitoUserPool
       ClientId: !Ref CognitoUserPoolClient
       CloudFrontDomain: !GetAtt CloudFrontDistribution.DomainName
       GADualStackDns: !GetAtt GlobalAccelerator.DualStackDnsName
+      CognitoDomain: cognito.nx.run
+      GatewayNamespace: envoy-gateway-system
+
+  # ============================================================================
+  # SECTION 12: POST-DEPLOY NLB HEALTH CHECK
+  # ============================================================================
+
+  # Ensures NLB port 80 listener exists after all Gateway updates.
+  # EKS Auto Mode's LB controller can lose listeners during Gateway reconcile.
+  NlbHealthCheck:
+    Type: Custom::NlbHealthCheck
+    DependsOn:
+      - HelmDeploy
+      - CognitoOidcSetup
+    Properties:
+      ServiceToken: !GetAtt NlbLookupFunction.Arn
+      ClusterName: !Ref EksCluster
+      Namespace: !Sub "cnf-${EnvironmentId}"
+      Region: !Ref "AWS::Region"
+      NlbArn: !GetAtt NlbLookup.NlbArn
+      NlbDns: !GetAtt NlbLookup.NlbDns
+      RequiredPort: 80
+      CloudFrontUrl: !Sub "http://${CloudFrontDistribution.DomainName}/llm/health/readiness"
 
 # ==============================================================================
 # OUTPUTS
