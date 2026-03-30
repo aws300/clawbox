@@ -850,6 +850,8 @@ Resources:
                 Action:
                   - elasticloadbalancing:DescribeLoadBalancers
                   - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:DescribeTargetHealth
                 Resource: "*"
               - Effect: Allow
                 Action:
@@ -2447,27 +2449,6 @@ Resources:
                       name: ga-https-cert
                     - kind: Secret
                       name: eg-https-cert
-
-              - name: https-7883
-                port: 7883
-                protocol: HTTPS
-                hostname: !GetAtt GlobalAccelerator.DualStackDnsName
-                allowedRoutes:
-                  namespaces:
-                    from: All
-                tls:
-                  mode: Terminate
-                  certificateRefs:
-                    - kind: Secret
-                      name: ga-https-cert
-              - name: tcp-7881
-                port: 7881
-                protocol: TCP
-                allowedRoutes:
-                  kinds:
-                    - kind: TCPRoute
-                  namespaces:
-                    from: All
         # --- StorageClass (EFS with uid/gid 1000) ---
         - apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -2848,52 +2829,6 @@ Resources:
           ClientIPPreservationEnabled: true
           Weight: 100
 
-
-  GAListenerExtra1:
-    Type: AWS::GlobalAccelerator::Listener
-    Properties:
-      AcceleratorArn: !Ref GlobalAccelerator
-      Protocol: TCP
-      PortRanges:
-        - FromPort: 7883
-          ToPort: 7883
-
-  GAEndpointGroupExtra1:
-    Type: AWS::GlobalAccelerator::EndpointGroup
-    Properties:
-      ListenerArn: !Ref GAListenerExtra1
-      EndpointGroupRegion: !Ref "AWS::Region"
-      HealthCheckProtocol: TCP
-      HealthCheckPort: 7883
-      HealthCheckIntervalSeconds: 30
-      ThresholdCount: 3
-      EndpointConfigurations:
-        - EndpointId: !GetAtt NlbLookup.NlbArn
-          ClientIPPreservationEnabled: true
-          Weight: 100
-
-  GAListenerExtra2:
-    Type: AWS::GlobalAccelerator::Listener
-    Properties:
-      AcceleratorArn: !Ref GlobalAccelerator
-      Protocol: TCP
-      PortRanges:
-        - FromPort: 7881
-          ToPort: 7881
-
-  GAEndpointGroupExtra2:
-    Type: AWS::GlobalAccelerator::EndpointGroup
-    Properties:
-      ListenerArn: !Ref GAListenerExtra2
-      EndpointGroupRegion: !Ref "AWS::Region"
-      HealthCheckProtocol: TCP
-      HealthCheckPort: 7881
-      HealthCheckIntervalSeconds: 30
-      ThresholdCount: 3
-      EndpointConfigurations:
-        - EndpointId: !GetAtt NlbLookup.NlbArn
-          ClientIPPreservationEnabled: true
-          Weight: 100
   # ============================================================================
   # SECTION 10: KUBERNETES APP RESOURCES (Test Pod + Routes + OIDC Policy)
   # ============================================================================
@@ -3267,27 +3202,6 @@ Resources:
                       name: ga-https-cert
                     - kind: Secret
                       name: eg-https-cert
-
-              - name: https-7883
-                port: 7883
-                protocol: HTTPS
-                hostname: !GetAtt GlobalAccelerator.DualStackDnsName
-                allowedRoutes:
-                  namespaces:
-                    from: All
-                tls:
-                  mode: Terminate
-                  certificateRefs:
-                    - kind: Secret
-                      name: ga-https-cert
-              - name: tcp-7881
-                port: 7881
-                protocol: TCP
-                allowedRoutes:
-                  kinds:
-                    - kind: TCPRoute
-                  namespaces:
-                    from: All
               - name: https-lb
                 port: 443
                 protocol: HTTPS
